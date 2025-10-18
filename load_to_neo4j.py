@@ -6,7 +6,7 @@ import config
 
 DATA_FILE = "vietnam_travel_dataset.json"
 
-driver = GraphDatabase.driver(config.NEO4J_URI, auth=(config.NEO4J_USER, config.NEO4J_PASSWORD))
+driver = GraphDatabase.driver(config.NEO4J_URI, auth=(config.NEO4J_USERNAME, config.NEO4J_PASSWORD))
 
 def create_constraints(tx):
     # generic uniqueness constraint on id for node label Entity (we also add label specific types)

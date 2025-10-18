@@ -5,6 +5,7 @@ from openai import OpenAI
 from pinecone import Pinecone, ServerlessSpec
 from neo4j import GraphDatabase
 import config
+from sentence_transformers import SentenceTransformer
 
 # -----------------------------
 # Config
@@ -20,6 +21,7 @@ INDEX_NAME = config.PINECONE_INDEX_NAME
 # -----------------------------
 client = OpenAI(api_key=config.OPENAI_API_KEY)
 pc = Pinecone(api_key=config.PINECONE_API_KEY)
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # Connect to Pinecone index
 if INDEX_NAME not in pc.list_indexes().names():
@@ -28,23 +30,22 @@ if INDEX_NAME not in pc.list_indexes().names():
         name=INDEX_NAME,
         dimension=config.PINECONE_VECTOR_DIM,
         metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east1-gcp")
+        spec=ServerlessSpec(cloud="aws", region="us-east-1")
     )
 
 index = pc.Index(INDEX_NAME)
 
 # Connect to Neo4j
 driver = GraphDatabase.driver(
-    config.NEO4J_URI, auth=(config.NEO4J_USER, config.NEO4J_PASSWORD)
+    config.NEO4J_URI, auth=(config.NEO4J_USERNAME, config.NEO4J_PASSWORD)
 )
 
 # -----------------------------
 # Helper functions
 # -----------------------------
 def embed_text(text: str) -> List[float]:
-    """Get embedding for a text string."""
-    resp = client.embeddings.create(model=EMBED_MODEL, input=[text])
-    return resp.data[0].embedding
+    """Get embedding for a text string using a local model."""
+    return model.encode(text).tolist()
 
 def pinecone_query(query_text: str, top_k=TOP_K):
     """Query Pinecone index using embedding."""

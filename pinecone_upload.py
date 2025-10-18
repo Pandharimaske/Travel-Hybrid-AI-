@@ -4,6 +4,7 @@ import time
 from tqdm import tqdm
 from openai import OpenAI
 from pinecone import Pinecone, ServerlessSpec
+from sentence_transformers import SentenceTransformer
 import config
 
 # -----------------------------
@@ -20,6 +21,7 @@ VECTOR_DIM = config.PINECONE_VECTOR_DIM  # 1536 for text-embedding-3-small
 # -----------------------------
 client = OpenAI(api_key=config.OPENAI_API_KEY)
 pc = Pinecone(api_key=config.PINECONE_API_KEY)
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # -----------------------------
 # Create managed index if it doesn't exist
@@ -32,8 +34,8 @@ if INDEX_NAME not in existing_indexes:
         dimension=VECTOR_DIM,
         metric="cosine",
         spec=ServerlessSpec(
-            cloud="gcp",
-            region="us-east1-gcp"
+            cloud="aws",
+            region="us-east-1"
         )
     )
 else:
@@ -45,10 +47,9 @@ index = pc.Index(INDEX_NAME)
 # -----------------------------
 # Helper functions
 # -----------------------------
-def get_embeddings(texts, model="text-embedding-3-small"):
-    """Generate embeddings using OpenAI v1.0+ API."""
-    resp = client.embeddings.create(model=model, input=texts)
-    return [data.embedding for data in resp.data]
+def get_embeddings(texts):
+    """Generate embeddings using a local SentenceTransformer model."""
+    return model.encode(texts).tolist()
 
 def chunked(iterable, n):
     for i in range(0, len(iterable), n):
@@ -82,7 +83,7 @@ def main():
         texts = [item[1] for item in batch]
         metas = [item[2] for item in batch]
 
-        embeddings = get_embeddings(texts, model="text-embedding-3-small")
+        embeddings = get_embeddings(texts)
 
         vectors = [
             {"id": _id, "values": emb, "metadata": meta}

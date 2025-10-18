@@ -6,7 +6,7 @@ import config
 
 NEO_BATCH = 500  # number of relationships to fetch / visualize
 
-driver = GraphDatabase.driver(config.NEO4J_URI, auth=(config.NEO4J_USER, config.NEO4J_PASSWORD))
+driver = GraphDatabase.driver(config.NEO4J_URI, auth=(config.NEO4J_USERNAME, config.NEO4J_PASSWORD))
 
 def fetch_subgraph(tx, limit=500):
     # fetch nodes and relationships up to a limit
