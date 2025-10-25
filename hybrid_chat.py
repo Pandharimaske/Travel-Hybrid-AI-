@@ -1,150 +1,119 @@
-# hybrid_chat.py
-import json
-from typing import List
-from openai import OpenAI
-from pinecone import Pinecone, ServerlessSpec
-from neo4j import GraphDatabase
-import config
-from sentence_transformers import SentenceTransformer
+import asyncio
+import logging
+from state import AgentState
+from langgraph.graph import StateGraph, END
+from GraphNodes.pinecone_node import call_pinecone_node
+from GraphNodes.cypher_node import call_cypher_node
+from GraphNodes.router_node import router_node
+from GraphNodes.answer_node import synthesize_answer_node
 
 # -----------------------------
-# Config
+# Logging Setup
 # -----------------------------
-EMBED_MODEL = "text-embedding-3-small"
-CHAT_MODEL = "gpt-4o-mini"
-TOP_K = 5
-
-INDEX_NAME = config.PINECONE_INDEX_NAME
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 # -----------------------------
-# Initialize clients
+# Conditional Router
 # -----------------------------
-client = OpenAI(api_key=config.OPENAI_API_KEY)
-pc = Pinecone(api_key=config.PINECONE_API_KEY)
-model = SentenceTransformer('all-MiniLM-L6-v2')
+def conditional_router(state: AgentState) -> str:
+    """Decides which branch to follow based on router_decision."""
+    logger.info("--- 2. Calling Conditional Router ---")
+    decision = state["router_decision"]
+    logger.info(f"Routing to: '{decision}'")
+    return decision
 
-# Connect to Pinecone index
-if INDEX_NAME not in pc.list_indexes().names():
-    print(f"Creating managed index: {INDEX_NAME}")
-    pc.create_index(
-        name=INDEX_NAME,
-        dimension=config.PINECONE_VECTOR_DIM,
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1")
-    )
+# -----------------------------
+# Parallel Search Node
+# -----------------------------
+async def parallel_search_node(state: AgentState) -> dict:
+    """
+    Triggers parallel execution of Pinecone and Cypher searches.
+    This node doesn't modify the state — it just signals both to start.
+    """
+    logger.info("--- 3. Triggering Parallel Searches ---")
+    return {}
 
-index = pc.Index(INDEX_NAME)
+# -----------------------------
+# Graph Assembly
+# -----------------------------
+logger.info("Assembling LangGraph workflow...")
+workflow = StateGraph(AgentState)
 
-# Connect to Neo4j
-driver = GraphDatabase.driver(
-    config.NEO4J_URI, auth=(config.NEO4J_USERNAME, config.NEO4J_PASSWORD)
+workflow.add_node("router", router_node)
+workflow.add_node("pinecone_search", call_pinecone_node)
+workflow.add_node("cypher_search", call_cypher_node)
+workflow.add_node("synthesize_answer", synthesize_answer_node)
+workflow.add_node("parallel_search", parallel_search_node)
+
+workflow.set_entry_point("router")
+
+workflow.add_conditional_edges(
+    "router",
+    conditional_router,
+    {
+        "pinecone": "pinecone_search",
+        "cypher": "cypher_search",
+        "both": "parallel_search",
+        "none": "synthesize_answer"
+    }
 )
 
-# -----------------------------
-# Helper functions
-# -----------------------------
-def embed_text(text: str) -> List[float]:
-    """Get embedding for a text string using a local model."""
-    return model.encode(text).tolist()
+workflow.add_edge("parallel_search", "pinecone_search")
+workflow.add_edge("parallel_search", "cypher_search")
 
-def pinecone_query(query_text: str, top_k=TOP_K):
-    """Query Pinecone index using embedding."""
-    vec = embed_text(query_text)
-    res = index.query(
-        vector=vec,
-        top_k=top_k,
-        include_metadata=True,
-        include_values=False
-    )
-    print("DEBUG: Pinecone top 5 results:")
-    print(len(res["matches"]))
-    return res["matches"]
+workflow.add_edge("pinecone_search", "synthesize_answer")
+workflow.add_edge("cypher_search", "synthesize_answer")
 
-def fetch_graph_context(node_ids: List[str], neighborhood_depth=1):
-    """Fetch neighboring nodes from Neo4j."""
-    facts = []
-    with driver.session() as session:
-        for nid in node_ids:
-            q = (
-                "MATCH (n:Entity {id:$nid})-[r]-(m:Entity) "
-                "RETURN type(r) AS rel, labels(m) AS labels, m.id AS id, "
-                "m.name AS name, m.type AS type, m.description AS description "
-                "LIMIT 10"
-            )
-            recs = session.run(q, nid=nid)
-            for r in recs:
-                facts.append({
-                    "source": nid,
-                    "rel": r["rel"],
-                    "target_id": r["id"],
-                    "target_name": r["name"],
-                    "target_desc": (r["description"] or "")[:400],
-                    "labels": r["labels"]
-                })
-    print("DEBUG: Graph facts:")
-    print(len(facts))
-    return facts
+workflow.add_edge("synthesize_answer", END)
 
-def build_prompt(user_query, pinecone_matches, graph_facts):
-    """Build a chat prompt combining vector DB matches and graph facts."""
-    system = (
-        "You are a helpful travel assistant. Use the provided semantic search results "
-        "and graph facts to answer the user's query briefly and concisely. "
-        "Cite node ids when referencing specific places or attractions."
-    )
-
-    vec_context = []
-    for m in pinecone_matches:
-        meta = m["metadata"]
-        score = m.get("score", None)
-        snippet = f"- id: {m['id']}, name: {meta.get('name','')}, type: {meta.get('type','')}, score: {score}"
-        if meta.get("city"):
-            snippet += f", city: {meta.get('city')}"
-        vec_context.append(snippet)
-
-    graph_context = [
-        f"- ({f['source']}) -[{f['rel']}]-> ({f['target_id']}) {f['target_name']}: {f['target_desc']}"
-        for f in graph_facts
-    ]
-
-    prompt = [
-        {"role": "system", "content": system},
-        {"role": "user", "content":
-         f"User query: {user_query}\n\n"
-         "Top semantic matches (from vector DB):\n" + "\n".join(vec_context[:10]) + "\n\n"
-         "Graph facts (neighboring relations):\n" + "\n".join(graph_context[:20]) + "\n\n"
-         "Based on the above, answer the user's question. If helpful, suggest 2–3 concrete itinerary steps or tips and mention node ids for references."}
-    ]
-    return prompt
-
-def call_chat(prompt_messages):
-    """Call OpenAI ChatCompletion."""
-    resp = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=prompt_messages,
-        max_tokens=600,
-        temperature=0.2
-    )
-    return resp.choices[0].message.content
+app = workflow.compile()
+logger.info("Graph compiled successfully.")
 
 # -----------------------------
-# Interactive chat
+# Main Async Runner
 # -----------------------------
-def interactive_chat():
-    print("Hybrid travel assistant. Type 'exit' to quit.")
+async def main():
+    logger.info("Vietnam Travel Assistant is ready!")
+
+    print("\n--- Vietnam Travel Assistant ---")
+    print("Ask me about hotels, cities, and activities in Vietnam.")
+    print("Type 'exit' or 'quit' to end the conversation.")
+    print("---------------------------------")
+
     while True:
-        query = input("\nEnter your travel question: ").strip()
-        if not query or query.lower() in ("exit","quit"):
+        query = input("\nUser: ").strip()
+
+        if not query or query.lower() in ("exit", "quit"):
+            print("\nAssistant: Goodbye! Have a great day.")
             break
 
-        matches = pinecone_query(query, top_k=TOP_K)
-        match_ids = [m["id"] for m in matches]
-        graph_facts = fetch_graph_context(match_ids)
-        prompt = build_prompt(query, matches, graph_facts)
-        answer = call_chat(prompt)
-        print("\n=== Assistant Answer ===\n")
-        print(answer)
-        print("\n=== End ===\n")
+        inputs = {
+            "question": query,
+            "router_decision": "",
+            "vector_search_context": "",
+            "graph_search_context": "",
+            "answer": ""
+        }
 
+        try:
+            final_state: AgentState = await app.ainvoke(inputs)
+            answer = final_state.get(
+                "answer",
+                "Sorry, I seem to have lost my train of thought. Could you ask again?"
+            )
+            print(f"\nAssistant:\n{answer}")
+
+        except Exception as e:
+            logger.exception("Error in workflow execution")
+            print(f"\nAssistant: [An error occurred: {e}]")
+            print("I'm sorry, I ran into a problem. Please try rephrasing your question.")
+
+# -----------------------------
+# Entry Point
+# -----------------------------
 if __name__ == "__main__":
-    interactive_chat()
+    asyncio.run(main())
